@@ -57,8 +57,8 @@ func (c *conn) Write(data []byte) error {
 
 func (c *conn) willWrite(data []byte) {
 	c.lock.Lock()
+	defer c.lock.Unlock()
 	c.out = append(c.out, data...)
-	c.lock.Unlock()
 	c.loop.poll.ModReadWrite(c.fd)
 }
 
@@ -266,9 +266,8 @@ func loopOpened(s *server, l *loop, c *conn) error {
 	}
 
 	c.lock.Lock()
-	empty := len(c.out) == 0
-	c.lock.Unlock()
-	if empty && c.action == None {
+	defer c.lock.Unlock()
+	if len(c.out) == 0 && c.action == None {
 		l.poll.ModRead(c.fd)
 	}
 
@@ -286,14 +285,13 @@ func loopWrite(s *server, l *loop, c *conn) error {
 		return loopCloseConn(s, l, c, err)
 	}
 
+	defer c.lock.Unlock()
 	if n == len(c.out) {
-		c.out = nil
+		c.out = c.out[:0]
 	} else {
-		c.out = c.out[n:]
+		c.out = append(c.out[:0], c.out[n:]...)
 	}
-	empty := len(c.out) == 0
-	c.lock.Unlock()
-	if empty && c.action == None {
+	if len(c.out) == 0 && c.action == None {
 		l.poll.ModRead(c.fd)
 	}
 
@@ -311,11 +309,11 @@ func loopAction(s *server, l *loop, c *conn) error {
 	}
 
 	c.lock.Lock()
-	empty := len(c.out) == 0
-	c.lock.Unlock()
-	if empty && c.action == None {
+	defer c.lock.Unlock()
+	if len(c.out) == 0 && c.action == None {
 		l.poll.ModRead(c.fd)
 	}
+
 	return nil
 }
 
@@ -330,18 +328,20 @@ func loopRead(s *server, l *loop, c *conn) error {
 	}
 	in = l.packet[:n]
 	if !c.reuse {
-		in = append([]byte{}, in...)
+		in = append([]byte(nil), in...)
 	}
 	if s.events.Data != nil {
 		out, action := s.events.Data(c, in)
 		c.action = action
 		if len(out) > 0 {
 			c.lock.Lock()
-			c.out = append([]byte{}, out...)
+			c.out = append([]byte(nil), out...)
 			c.lock.Unlock()
 		}
 	}
 
+	// conn.Write sets ModReadWrite as well, we don't need to worry about missing Write mode,
+	// so not necessary to wrap ModReadWrite in lock/unlock.
 	c.lock.Lock()
 	empty := len(c.out) == 0
 	c.lock.Unlock()
