@@ -1,6 +1,8 @@
 package internal
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestNew(t *testing.T) {
 	efd, err := newEventFd()
@@ -23,7 +25,7 @@ func TestReadWriteEvent(t *testing.T) {
 	}
 	defer efd.Close()
 
-	var good uint64 = 0x0102030405060708
+	var good uint64 = 0x78
 	if err := efd.WriteEvent(good); err != nil {
 		t.Error(err)
 	}
@@ -32,5 +34,26 @@ func TestReadWriteEvent(t *testing.T) {
 		t.Error(err)
 	} else if actual != good {
 		t.Errorf("error reading from eventfd, expected: %q, actual: %q", good, actual)
+	}
+}
+
+func BenchmarkReadWriteEvent(b *testing.B) {
+	const event = 15
+	efd, err := newEventFd()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer efd.Close()
+
+	for i := 0; i < b.N; i++ {
+		if err := efd.WriteEvent(event); err != nil {
+			b.Fatal(err)
+		}
+		val, err := efd.ReadEvent()
+		if err != nil {
+			b.Fatal(err)
+		} else if val != event {
+			b.Fail()
+		}
 	}
 }
