@@ -176,6 +176,7 @@ func must(err error) {
 		panic(err)
 	}
 }
+
 func TestTick(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -200,6 +201,7 @@ func TestTick(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
 func testTick(network, addr string, stdlib bool) {
 	var events Events
 	var count int
