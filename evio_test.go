@@ -74,7 +74,6 @@ func TestServe(t *testing.T) {
 			})
 		})
 	})
-
 }
 
 func testServe(network, addr string, unix bool, nclients, nloops int, balance LoadBalance) {
