@@ -18,9 +18,10 @@ import (
 	reuseport "github.com/kavu/go_reuseport"
 )
 
+const writeEventBuf = 128
+
 type conn struct {
 	fd         int              // file descriptor
-	lock       sync.Mutex       // out buffer guard
 	out        []byte           // write buffer
 	sa         syscall.Sockaddr // remote socket address
 	reuse      bool             // should reuse input buffer
@@ -41,25 +42,31 @@ func (c *conn) Write(data []byte) error {
 	n, err := syscall.Write(c.fd, data)
 	if err != nil {
 		if err == syscall.EAGAIN {
-			c.willWrite(data)
-			return nil
+			return c.willWrite(data)
 		}
 
 		return err
 	}
 
 	if n < len(data) {
-		c.willWrite(data[n:])
+		return c.willWrite(data[n:])
 	}
 
 	return nil
 }
 
-func (c *conn) willWrite(data []byte) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	c.out = append(c.out, data...)
-	c.loop.poll.ModReadWrite(c.fd)
+func (c *conn) willWrite(data []byte) error {
+	c.loop.wch <- writeEvent{
+		c:    c,
+		data: data,
+	}
+
+	return c.loop.poll.FireEvent(internal.EventWrite)
+}
+
+type writeEvent struct {
+	c    *conn
+	data []byte
 }
 
 type server struct {
@@ -74,11 +81,12 @@ type server struct {
 }
 
 type loop struct {
-	idx     int            // loop index in the server loops list
-	poll    *internal.Poll // epoll or kqueue
-	packet  []byte         // read packet buffer
-	fdconns map[int]*conn  // loop connections fd -> conn
-	count   int32          // connection count
+	idx     int             // loop index in the server loops list
+	poll    *internal.Poll  // epoll or kqueue
+	packet  []byte          // read packet buffer
+	fdconns map[int]*conn   // loop connections fd -> conn
+	count   int32           // connection count
+	wch     chan writeEvent // write event channel
 }
 
 // waitForShutdown waits for a signal to shutdown
@@ -131,7 +139,7 @@ func serve(events Events, listener *listener) error {
 
 		// notify all loops to close by closing all listeners
 		for _, l := range s.loops {
-			l.poll.Trigger(errClosing)
+			l.poll.FireEvent(internal.EventClose)
 		}
 
 		// wait on all loops to complete reading events
@@ -153,6 +161,7 @@ func serve(events Events, listener *listener) error {
 			poll:    internal.OpenPoll(),
 			packet:  make([]byte, 0xFFFF),
 			fdconns: make(map[int]*conn),
+			wch:     make(chan writeEvent, writeEventBuf),
 		}
 		l.poll.AddRead(listener.fd)
 		s.loops = append(s.loops, l)
@@ -197,7 +206,7 @@ func loopRun(s *server, l *loop) {
 
 func loopTicker(s *server, l *loop) {
 	for {
-		if err := l.poll.Trigger(time.Duration(0)); err != nil {
+		if err := l.poll.FireEvent(internal.EventTick); err != nil {
 			break
 		}
 		time.Sleep(<-s.tch)
@@ -250,9 +259,7 @@ func loopOpened(s *server, l *loop, c *conn) error {
 	if s.events.Opened != nil {
 		out, opts, action := s.events.Opened(c)
 		if len(out) > 0 {
-			c.lock.Lock()
 			c.out = append([]byte(nil), out...)
-			c.lock.Unlock()
 		}
 		c.action = action
 		c.reuse = opts.ReuseInputBuffer
@@ -265,8 +272,6 @@ func loopOpened(s *server, l *loop, c *conn) error {
 		}
 	}
 
-	c.lock.Lock()
-	defer c.lock.Unlock()
 	if len(c.out) == 0 && c.action == None {
 		l.poll.ModRead(c.fd)
 	}
@@ -275,17 +280,14 @@ func loopOpened(s *server, l *loop, c *conn) error {
 }
 
 func loopWrite(s *server, l *loop, c *conn) error {
-	c.lock.Lock()
 	n, err := syscall.Write(c.fd, c.out)
 	if err != nil {
-		c.lock.Unlock()
 		if err == syscall.EAGAIN {
 			return nil
 		}
 		return loopCloseConn(s, l, c, err)
 	}
 
-	defer c.lock.Unlock()
 	if n == len(c.out) {
 		c.out = c.out[:0]
 	} else {
@@ -308,8 +310,6 @@ func loopAction(s *server, l *loop, c *conn) error {
 		return errClosing
 	}
 
-	c.lock.Lock()
-	defer c.lock.Unlock()
 	if len(c.out) == 0 && c.action == None {
 		l.poll.ModRead(c.fd)
 	}
@@ -334,18 +334,11 @@ func loopRead(s *server, l *loop, c *conn) error {
 		out, action := s.events.Data(c, in)
 		c.action = action
 		if len(out) > 0 {
-			c.lock.Lock()
 			c.out = append([]byte(nil), out...)
-			c.lock.Unlock()
 		}
 	}
 
-	// conn.Write sets ModReadWrite as well, we don't need to worry about missing Write mode,
-	// so not necessary to wrap ModReadWrite in lock/unlock.
-	c.lock.Lock()
-	empty := len(c.out) == 0
-	c.lock.Unlock()
-	if !empty || c.action != None {
+	if len(c.out) != 0 || c.action != None {
 		l.poll.ModReadWrite(c.fd)
 	}
 
@@ -402,6 +395,14 @@ func (h eventHandler) OnEvent(event uint64) error {
 			return errClosing
 		}
 		h.s.tch <- delay
+	case internal.EventWrite:
+		select {
+		case wevent := <-h.l.wch:
+			wevent.c.out = append(wevent.c.out, wevent.data...)
+			h.l.poll.ModReadWrite(wevent.c.fd)
+		default:
+			// if nothing, continue
+		}
 	}
 
 	return nil
@@ -413,13 +414,10 @@ func (h eventHandler) OnFdEvent(fd int) error {
 		return loopAccept(h.s, h.l)
 	}
 
-	c.lock.Lock()
-	empty := len(c.out) == 0
-	c.lock.Unlock()
 	switch {
 	case !c.opened:
 		return loopOpened(h.s, h.l, c)
-	case !empty:
+	case len(c.out) != 0:
 		return loopWrite(h.s, h.l, c)
 	case c.action != None:
 		return loopAction(h.s, h.l, c)

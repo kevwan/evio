@@ -22,7 +22,6 @@ type (
 	Poll struct {
 		fd      int // epoll fd
 		eventFd *EventFd
-		notes   noteQueue
 	}
 )
 
@@ -54,12 +53,6 @@ func (p *Poll) Close() error {
 
 func (p *Poll) FireEvent(event uint64) error {
 	return p.eventFd.WriteEvent(event)
-}
-
-// Trigger ...
-func (p *Poll) Trigger(note interface{}) error {
-	p.notes.Add(note)
-	return p.eventFd.WriteEvent(1)
 }
 
 // Wait ...
